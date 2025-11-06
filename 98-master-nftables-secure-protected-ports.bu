@@ -1,0 +1,90 @@
+$cat 98-master-nftables-secure-protected-ports.bu 
+variant: openshift
+version: 4.16.0
+metadata:
+  name: 98-master-nftables-secure-protected-ports
+  labels:
+    machineconfiguration.openshift.io/role: master
+systemd:
+  units:
+    - name: "nftables.service"
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Netfilter Tables
+        Documentation=man:nft(8)
+        Wants=network-pre.target
+        Before=network-pre.target
+        [Service]
+        Type=oneshot
+        ProtectSystem=full
+        ProtectHome=true
+        ExecStart=/sbin/nft -f /etc/sysconfig/nftables.conf
+        ExecReload=/sbin/nft -f /etc/sysconfig/nftables.conf
+        ExecStop=/sbin/nft 'add table inet control_plane_acl; delete table inet control_plane_acl'
+        RemainAfterExit=yes
+        [Install]
+        WantedBy=multi-user.target
+storage:
+  files:
+  - path: /etc/sysconfig/nftables.conf
+    mode: 0600
+    overwrite: true
+    contents:
+      inline: |
+        table inet control_plane_acl
+        delete table inet control_plane_acl
+        table inet control_plane_acl {
+            set trusted_interfaces {
+                type ifname;
+                flags interval;
+                # Trusted interfaces:
+                # - br-ex: External bridge interface (node ↔ outside world)
+                # - lo: Loopback interface
+                # - ovn-k8s-mp0: OVN Kubernetes management port
+                elements = { "br-ex", "lo", "ovn-k8s-mp0" }
+                }
+
+            set protected_ports {
+                type inet_service;
+                flags interval;
+                # List of Protected ports 
+                # Protected ports - restrict access to critical services:
+                # - 53: DNS
+                # - 2379-2380: etcd (Kubernetes control plane)
+                # - 6443: Kubernetes API service
+                elements = { 53, 2379-2380, 6443 }
+                }
+
+            set protected_subnets {
+                type ipv4_addr
+                flags interval
+                # Protected source subnets - allow traffic only from known/authorized networks:
+                # - 10.6.115.0/24: machineNetwork (from install-config.yaml)
+                # - 10.128.0.0/14: clusterNetwork (pod network CIDR)
+                # - 169.254.169.1: link-local subnet used by OVN
+                # - 127.0.0.1: localhost (loopback)
+                elements = { 10.6.115.0/24, 10.128.0.0/14, 169.254.169.1, 127.0.0.1 }
+                }
+
+            set protected_ssh_subnets {
+                type ipv4_addr
+                flags interval
+                # Protected source subnets - allow ssh traffic only from known/authorized node such as bastion host
+                elements = { 10.22.88.83/32 }
+                }
+
+            chain custom_chain_INPUT {
+                type filter hook input priority 1; policy accept;
+                # DROP if arriving on non-trusted interface or source targeting protected control plane TCP ports
+                iifname != @trusted_interfaces tcp dport @protected_ports log prefix "[NODEFIREWALL] DROP TCP: UNTRUSTED INTERFACE " drop
+                ip saddr != @protected_subnets tcp dport @protected_ports log prefix "[NODEFIREWALL] DROP TCP: UNTRUSTED SOURCE " drop
+                # DROP if arriving on non-trusted interface or source targeting protected control plane UDP ports
+                iifname != @trusted_interfaces udp dport @protected_ports log prefix "[NODEFIREWALL] DROP UDP: UNTRUSTED INTERFACE " drop
+                ip saddr != @protected_subnets udp dport @protected_ports log prefix "[NODEFIREWALL] DROP UDP: UNTRUSTED SOURCE " drop
+                # Add general SSH restriction rules if needed
+                iifname != { "br-ex" } tcp dport ssh log prefix "[NODEFIREWALL] DROP SSH: UNTRUSTED INTERFACE " drop
+                ip saddr != @protected_ssh_subnets tcp dport ssh log prefix "[NODEFIREWALL] DROP SSH: UNTRUSTED SOURCE " drop
+            }
+        }
+
